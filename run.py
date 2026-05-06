@@ -4,9 +4,10 @@ from typing import Optional
 from datetime import datetime
 from dotenv import load_dotenv
 from google import genai
-from google.genai import types
+from google.genai import types, errors
 import json
 import os
+import time
 
 # =========================================
 # LOAD ENV
@@ -14,13 +15,8 @@ import os
 
 load_dotenv()
 
-# =========================================
-# GEMINI CONFIG
-# =========================================
-
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL_NAME = os.getenv("MODEL_NAME")
-
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -34,6 +30,13 @@ app = FastAPI(
 )
 
 # =========================================
+# CUSTOM EXCEPTION
+# =========================================
+
+class AIServiceError(Exception):
+    pass
+
+# =========================================
 # REQUEST MODEL
 # =========================================
 
@@ -44,9 +47,7 @@ class TripRequest(BaseModel):
     start_date: str
     end_date: str
 
-    trip_type: str = Field(
-        description="solo / couple / group"
-    )
+    trip_type: str = Field(description="solo / couple / group")
 
     group_people: Optional[int] = 0
     couple_pairs: Optional[int] = 0
@@ -58,25 +59,37 @@ class TripRequest(BaseModel):
 
 
 # =========================================
-# VALIDATION
+# DATE VALIDATION (PAST + FORMAT)
 # =========================================
 
 def validate_date(date_text):
-    try:
-        return datetime.strptime(date_text, "%Y-%m-%d")
 
-    except ValueError:
+    try:
+        date_obj = datetime.strptime(date_text, "%Y-%m-%d")
+    except Exception:
         raise HTTPException(
             status_code=400,
-            detail="Date must be YYYY-MM-DD"
+            detail="Invalid date format. Use YYYY-MM-DD"
         )
 
+    today = datetime.now()
+    today = datetime(today.year, today.month, today.day)
 
-def calculate_travelers(
-    trip_type,
-    group_people=0,
-    couple_pairs=0
-):
+    if date_obj < today:
+        raise HTTPException(
+            status_code=400,
+            detail="Past date not allowed. Please select today or future date."
+        )
+
+    return date_obj
+
+
+# =========================================
+# TRAVELER CALCULATION
+# =========================================
+
+def calculate_travelers(trip_type, group_people=0, couple_pairs=0):
+
     trip_type = trip_type.lower()
 
     if trip_type == "solo":
@@ -106,187 +119,50 @@ You are Travaily AI Planner.
 
 Create HIGH QUALITY day-wise travel itinerary JSON.
 
-=========================================
-USER DETAILS
-=========================================
-
-Source City: {data['source']}
+Source: {data['source']}
 Destination: {data['destination']}
-Start Date: {data['start_date']}
-End Date: {data['end_date']}
+Start: {data['start_date']}
+End: {data['end_date']}
 Trip Type: {data['trip_type']}
-Total Travelers: {data['total_travelers']}
-Trip Mood: {data['trip_mood']}
-Food Preference: {data['food_pref']}
-Transport Preference: {data['transport_pref']}
+Travelers: {data['total_travelers']}
+Mood: {data['trip_mood']}
+Food: {data['food_pref']}
+Transport: {data['transport_pref']}
 Budget: {data['budget']}
 
-=========================================
-VERY IMPORTANT RULES
-=========================================
-
-1. Create MOBILE APP FRIENDLY itinerary JSON.
-
-2. Give DAY-WISE timeline format.
-
-3. Every activity MUST include:
-   - exact timing
-   - opening time
-   - closing time
-   - whether place is currently open during selected slot
-   - visit duration
-   - travel time
-   - distance
-
-4. VERY IMPORTANT:
-   Many Indian temples/gardens/museums close in afternoon.
-
-5. CHECK REALISTIC OPEN/CLOSE TIME LOGIC.
-
-6. If place closed during suggested slot:
-   - set "is_open_during_visit": false
-   - suggest alternative time
-
-7. Keep response PERFECT for mobile timeline UI.
-
-8. Add image keywords for frontend image search.
-
-9. Add weather notes for each day.
-
-10. Add estimated activity cost.
-
-11. Add best photography timing if possible.
-
-12. Add crowd level:
-   low / medium / high
-
-13. Seasonal place validation:
-   If destination closed in selected dates:
-   - set is_trip_possible false
-   - mention reason
-   - suggest best months
-
-14. Return ONLY VALID JSON.
-
-=========================================
-JSON FORMAT
-=========================================
-
-{{
-  "is_trip_possible": true,
-
-  "trip_summary": "",
-
-  "weather_summary": "",
-
-  "daily_itinerary": [
-    {{
-      "day": 1,
-      "date": "",
-      "day_title": "",
-      "weather_note": "",
-
-      "timeline": [
-        {{
-          "time": "08:00 AM",
-
-          "activity_title": "",
-
-          "place_name": "",
-
-          "activity_type": "",
-
-          "description": "",
-
-          "opening_time": "",
-
-          "closing_time": "",
-
-          "is_open_during_visit": true,
-
-          "alternative_time_if_closed": "",
-
-          "visit_duration": "",
-
-          "travel_time_from_previous_place": "",
-
-          "distance_from_previous_place": "",
-
-          "estimated_activity_cost": "",
-
-          "best_photo_time": "",
-
-          "crowd_level": "",
-
-          "food_recommendation": "",
-
-          "tips": "",
-
-          "image_keywords": [
-            ""
-          ]
-        }}
-      ]
-    }}
-  ],
-
-  "cost_estimation": {{
-    "currency": "INR",
-
-    "flight_per_person": "",
-
-    "train_per_person": "",
-
-    "trip_per_person_without_transport": "",
-
-    "total_with_flight_per_person": "",
-
-    "total_with_train_per_person": "",
-
-    "full_trip_cost_all_people": ""
-  }},
-
-  "hotel_recommendation": {{
-    "best_area": "",
-
-    "hotel_type": "",
-
-    "avg_price_per_night": ""
-  }},
-
-  "safety": {{
-    "score": "",
-
-    "note": ""
-  }},
-
-  "permit_required": {{
-    "required": false,
-
-    "details": ""
-  }}
-}}
+Return ONLY valid JSON.
+Include timings, cost, weather, travel details.
 """
 
 
 # =========================================
-# GEMINI GENERATE
+# SAFE JSON PARSER
 # =========================================
 
-import time
-from google.genai import errors
+def safe_parse_json(text):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=500,
+            detail="AI returned invalid JSON response"
+        )
 
+
+# =========================================
+# GEMINI ENGINE (RETRY + ERROR HANDLING)
+# =========================================
 
 def generate_itinerary(data):
 
     prompt = create_prompt(data)
 
     retries = 3
+    last_error = None
 
     for attempt in range(retries):
 
         try:
-
             response = client.models.generate_content(
                 model=MODEL_NAME,
                 contents=prompt,
@@ -296,29 +172,26 @@ def generate_itinerary(data):
                 )
             )
 
-            return json.loads(response.text)
+            if not response or not response.text:
+                raise AIServiceError("Empty response from AI")
+
+            return safe_parse_json(response.text)
 
         except errors.ServerError as e:
-
-            print("Gemini overloaded:", e)
-
-            if attempt < retries - 1:
-
-                time.sleep(5)
-
-            else:
-
-                return {
-                    "success": False,
-                    "message": "Gemini servers are busy. Try again later."
-                }
+            last_error = str(e)
+            time.sleep(3 * (attempt + 1))
+            continue
 
         except Exception as e:
+            last_error = str(e)
+            time.sleep(2)
+            continue
 
-            return {
-                "success": False,
-                "message": str(e)
-            }
+    raise HTTPException(
+        status_code=503,
+        detail=f"AI service unavailable: {last_error}"
+    )
+
 
 # =========================================
 # API ROUTES
@@ -326,62 +199,68 @@ def generate_itinerary(data):
 
 @app.get("/")
 def home():
-    return {
-        "message": "Travaily AI Planner API Running 🚀"
-    }
+    return {"message": "Travaily AI Planner API Running 🚀"}
 
 
 @app.post("/generate-itinerary")
 def generate_trip(request: TripRequest):
 
-    # -----------------------------
-    # DATE VALIDATION
-    # -----------------------------
+    try:
 
-    validate_date(request.start_date)
-    validate_date(request.end_date)
+        # -------------------------
+        # DATE VALIDATION
+        # -------------------------
+        start = validate_date(request.start_date)
+        end = validate_date(request.end_date)
 
-    # -----------------------------
-    # TOTAL TRAVELERS
-    # -----------------------------
+        if end < start:
+            raise HTTPException(
+                status_code=400,
+                detail="End date cannot be before start date"
+            )
 
-    total_travelers = calculate_travelers(
-        request.trip_type,
-        request.group_people,
-        request.couple_pairs
-    )
+        # -------------------------
+        # TRAVELER COUNT
+        # -------------------------
+        total_travelers = calculate_travelers(
+            request.trip_type,
+            request.group_people,
+            request.couple_pairs
+        )
 
-    # -----------------------------
-    # PREPARE DATA
-    # -----------------------------
+        # -------------------------
+        # DATA PREP
+        # -------------------------
+        data = {
+            "source": request.source,
+            "destination": request.destination,
+            "start_date": request.start_date,
+            "end_date": request.end_date,
+            "trip_type": request.trip_type,
+            "group_people": request.group_people,
+            "couple_pairs": request.couple_pairs,
+            "total_travelers": total_travelers,
+            "trip_mood": request.trip_mood,
+            "food_pref": request.food_pref,
+            "transport_pref": request.transport_pref,
+            "budget": request.budget
+        }
 
-    data = {
-        "source": request.source,
-        "destination": request.destination,
+        # -------------------------
+        # GENERATE AI ITINERARY
+        # -------------------------
+        result = generate_itinerary(data)
 
-        "start_date": request.start_date,
-        "end_date": request.end_date,
+        return {
+            "success": True,
+            "data": result
+        }
 
-        "trip_type": request.trip_type,
+    except HTTPException as he:
+        raise he
 
-        "group_people": request.group_people,
-        "couple_pairs": request.couple_pairs,
-
-        "total_travelers": total_travelers,
-
-        "trip_mood": request.trip_mood,
-        "food_pref": request.food_pref,
-        "transport_pref": request.transport_pref,
-        "budget": request.budget
-    }
-
-    # -----------------------------
-    # GENERATE ITINERARY
-    # -----------------------------
-
-    result = generate_itinerary(data)
-
-    return {
-        "success": True,
-        "data": result
-    }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error: {str(e)}"
+        )
