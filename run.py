@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Literal
 from datetime import datetime
 from dotenv import load_dotenv
 from google import genai
@@ -26,6 +26,7 @@ app = FastAPI(
     version="2.0.0"
 )
 
+
 class TripRequest(BaseModel):
     source: str
     destination: str
@@ -38,6 +39,27 @@ class TripRequest(BaseModel):
     food_pref: str
     transport_pref: str
     budget: str
+
+
+class RePlanRequest(BaseModel):
+    old_itinerary: dict
+    reason: str
+    affected_date: str
+    affected_day: Optional[int] = None
+    current_time: Optional[str] = None
+    current_location: Optional[str] = None
+
+    replan_type: Literal[
+        "this_day_only",
+        "from_this_day_onward",
+        "full_trip"
+    ] = "from_this_day_onward"
+
+    keep_same_places: bool = True
+    include_missed_places: bool = True
+    suggest_nearby_places: bool = True
+    avoid_long_travel: bool = True
+    special_request: Optional[str] = None
 
 
 def validate_date(date_text: str):
@@ -58,6 +80,7 @@ def validate_date(date_text: str):
         )
 
     return date_obj
+
 
 def calculate_travelers(trip_type: str, group_people: int = 0, couple_pairs: int = 0):
     trip_type = trip_type.lower()
@@ -85,6 +108,7 @@ def calculate_travelers(trip_type: str, group_people: int = 0, couple_pairs: int
         status_code=400,
         detail="Trip type must be solo/couple/group"
     )
+
 
 def api_get(url: str, params: dict):
     try:
@@ -121,7 +145,8 @@ def get_coordinates(city: str):
         "latitude": props.get("lat"),
         "longitude": props.get("lon"),
         "address": props.get("formatted")
-    }  
+    }
+
 
 def get_current_weather(destination: str):
     if not OPENWEATHER_API_KEY:
@@ -146,6 +171,7 @@ def get_current_weather(destination: str):
         "humidity": f"{data.get('main', {}).get('humidity')}%",
         "wind_speed": f"{data.get('wind', {}).get('speed')} m/s"
     }
+
 
 def get_weather_forecast(destination: str):
     if not OPENWEATHER_API_KEY:
@@ -173,6 +199,7 @@ def get_weather_forecast(destination: str):
         }
         for item in forecast_list[:16]
     ]
+
 
 def get_air_pollution(latitude, longitude):
     if not OPENWEATHER_API_KEY or latitude is None or longitude is None:
@@ -448,6 +475,70 @@ Rules:
 """
 
 
+def create_replan_prompt(data: dict):
+    return f"""
+You are Travaily AI Re-planner.
+
+Re-plan the user's existing itinerary based on the new situation.
+
+Return ONLY valid JSON.
+Do not add markdown.
+Do not add explanation.
+Do not add text before or after JSON.
+
+IMPORTANT:
+Keep the SAME JSON response structure as the old itinerary.
+Do not remove required fields.
+Do not add extra root fields.
+
+Re-plan Type:
+{data["replan_type"]}
+
+Rules:
+- If replan_type is "this_day_only", only update the affected day.
+- If replan_type is "from_this_day_onward", update affected day and all next days.
+- If replan_type is "full_trip", re-plan full itinerary.
+- Keep already completed/past activities unchanged if possible.
+- Move missed important places to next suitable days if possible.
+- Keep trip practical and user-friendly.
+- Use realistic opening and closing timings.
+- Keep travel order logical.
+- Avoid unnecessary long travel when avoid_long_travel is true.
+- Include breakfast, lunch, dinner, hotel/rest where suitable.
+- Each day must have minimum 5 to 8 timeline items.
+- Every timeline item must include:
+  time, title, description, place, latitude, longitude,
+  open_time, close_time, open_close_display,
+  estimated_cost, transport_mode, travel_time,
+  distance, image_search_keyword, category, tips.
+- Categories must be one of:
+  sightseeing, food, hotel, shopping, adventure, travel, rest.
+- open_close_display must be short like:
+  "Open • 8 AM - 10 PM"
+  "Open • 9 AM - 6 PM"
+  "Flexible"
+
+User Situation:
+Reason: {data["reason"]}
+Affected Date: {data["affected_date"]}
+Affected Day: {data.get("affected_day")}
+Current Time: {data.get("current_time")}
+Current Location: {data.get("current_location")}
+Special Request: {data.get("special_request")}
+
+Preferences:
+Keep same places if possible: {data["keep_same_places"]}
+Include missed places in next days: {data["include_missed_places"]}
+Suggest alternative nearby places: {data["suggest_nearby_places"]}
+Avoid long travel: {data["avoid_long_travel"]}
+
+Old Itinerary:
+{json.dumps(data["old_itinerary"], indent=2)}
+
+Return updated itinerary JSON only.
+"""
+
+
 def safe_parse_json(text: str):
     try:
         return json.loads(text)
@@ -457,8 +548,8 @@ def safe_parse_json(text: str):
             detail="AI returned invalid JSON response"
         )
 
-def generate_itinerary(data: dict):
-    prompt = create_prompt(data)
+
+def generate_ai_json(prompt: str, temperature: float = 0.7):
     last_error = None
 
     for attempt in range(3):
@@ -467,7 +558,7 @@ def generate_itinerary(data: dict):
                 model=MODEL_NAME,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    temperature=0.7,
+                    temperature=temperature,
                     response_mime_type="application/json"
                 )
             )
@@ -494,11 +585,20 @@ def generate_itinerary(data: dict):
     )
 
 
+def generate_itinerary(data: dict):
+    return generate_ai_json(create_prompt(data), temperature=0.7)
+
+
+def generate_replanned_itinerary(data: dict):
+    return generate_ai_json(create_replan_prompt(data), temperature=0.5)
+
+
 @app.get("/")
 def home():
     return {
         "message": "Travaily AI Planner API Running 🚀"
     }
+
 
 @app.post("/generate-itinerary")
 def generate_trip(request: TripRequest):
@@ -566,11 +666,58 @@ def generate_trip(request: TripRequest):
 
         result = generate_itinerary(data)
 
-        # IMPORTANT:
-        # Response format not changed.
-        # No extra real_weather / places_count fields added.
         return {
             "success": True,
+            "data": result
+        }
+
+    except HTTPException as he:
+        raise he
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error: {str(e)}"
+        )
+
+
+@app.post("/replan-itinerary")
+def replan_trip(request: RePlanRequest):
+    try:
+        validate_date(request.affected_date)
+
+        if not request.old_itinerary:
+            raise HTTPException(
+                status_code=400,
+                detail="Old itinerary is required"
+            )
+
+        if not request.reason.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Re-plan reason is required"
+            )
+
+        data = {
+            "old_itinerary": request.old_itinerary,
+            "reason": request.reason,
+            "affected_date": request.affected_date,
+            "affected_day": request.affected_day,
+            "current_time": request.current_time,
+            "current_location": request.current_location,
+            "replan_type": request.replan_type,
+            "keep_same_places": request.keep_same_places,
+            "include_missed_places": request.include_missed_places,
+            "suggest_nearby_places": request.suggest_nearby_places,
+            "avoid_long_travel": request.avoid_long_travel,
+            "special_request": request.special_request
+        }
+
+        result = generate_replanned_itinerary(data)
+
+        return {
+            "success": True,
+            "message": "Itinerary re-planned successfully",
             "data": result
         }
 
